@@ -11,7 +11,6 @@ import asyncio
 import inspect
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -177,11 +176,9 @@ class TestLocalSTCrossEncoder:
         assert cleanup_calls == ["cleanup"]
 
     @pytest.mark.parametrize("bucket_batching", [False, True])
-    async def test_cancel_skips_batches_not_yet_started(self, monkeypatch, bucket_batching):
+    async def test_cancel_skips_batches_not_yet_started(self, bucket_batching):
         """Cancelling the caller lets the in-flight batch finish but starts no more,
         so the next request does not queue behind abandoned work (#5722)."""
-        executor = ThreadPoolExecutor(max_workers=1)
-        monkeypatch.setattr(LocalSTCrossEncoder, "_executor", executor)
         encoder = self._make_encoder(batch_size=1, bucket_batching=bucket_batching)
         started, release = threading.Event(), threading.Event()
         calls: list[str] = []
@@ -211,11 +208,45 @@ class TestLocalSTCrossEncoder:
             assert calls[1:] == ["successor"]
         finally:
             release.set()
-            executor.shutdown(wait=True)
+
+    async def test_concurrent_recalls_share_one_thread_and_passes(self):
+        """Every pass runs on the model's own worker thread, and pairs of recalls
+        that queued while a pass was running are packed into the next ones."""
+        encoder = self._make_encoder(batch_size=4)
+        started, release = threading.Event(), threading.Event()
+        threads: set[int] = set()
+        passes: list[list[str]] = []
+
+        def gated_predict(batch, **kwargs):
+            threads.add(threading.get_ident())
+            passes.append([doc for _, doc in batch])
+            if len(passes) == 1:
+                started.set()
+                assert release.wait(5)
+            return [float(len(doc)) for _, doc in batch]
+
+        encoder._model.predict.side_effect = gated_predict
+        try:
+            first = asyncio.create_task(encoder.predict([("q0", "a")]))
+            assert await asyncio.to_thread(started.wait, 5)
+            queued = [asyncio.create_task(encoder.predict([(f"q{i}", "b" * i), (f"q{i}", "c")])) for i in (1, 2, 3)]
+            await asyncio.sleep(0.05)
+            release.set()
+            results = await asyncio.wait_for(asyncio.gather(first, *queued), 5)
+        finally:
+            release.set()
+
+        assert results == [[1.0], [1.0, 1.0], [2.0, 1.0], [3.0, 1.0]]
+        assert threads == {encoder._worker._thread.ident}
+        assert threading.get_ident() not in threads
+        # Six queued pairs at four per pass: two passes, not one per recall.
+        assert passes == [["a"], ["b", "c", "bb", "c"], ["bbb", "c"]]
 
 
 # In-process rerankers whose `_predict_sync` loops over batches without honouring a
-# cancel flag, each with the reason that is acceptable.
+# cancel flag, each with the reason that is acceptable. LocalSTCrossEncoder is not in
+# the family at all: it has no batch loop of its own, its passes are scheduled by
+# LocalInferenceWorker, which stops on cancel (test_cancel_skips_batches_not_yet_started).
 _CANCEL_EXEMPT = {
     # One MLX call per query group, not a batch loop; recall sends a single query.
     "JinaMLXCrossEncoder",
@@ -233,7 +264,7 @@ def test_every_batching_reranker_takes_a_cancel_flag():
         for cls in _all_subclasses(ce_module.CrossEncoderModel)
         if "_predict_sync" in vars(cls) and cls.__name__ not in _CANCEL_EXEMPT
     }
-    assert batching == {"LocalSTCrossEncoder", "FlashRankCrossEncoder", "OnnxCrossEncoder"}
+    assert batching == {"FlashRankCrossEncoder", "OnnxCrossEncoder"}
     for name in batching:
         params = inspect.signature(getattr(ce_module, name)._predict_sync).parameters
         assert "cancelled" in params, name
@@ -243,18 +274,15 @@ def test_set_cancel_flag_starts_no_batch_in_any_provider():
     cancelled = threading.Event()
     cancelled.set()
 
-    local = LocalSTCrossEncoder()
-    local._model = MagicMock()
     flashrank = FlashRankCrossEncoder()
     flashrank._ranker = MagicMock()
     onnx = OnnxCrossEncoder(model_id="test/model")
     onnx._session, onnx._tokenizer = MagicMock(), MagicMock()
 
     with patch.dict("sys.modules", {"flashrank": MagicMock()}):
-        for encoder in (local, flashrank, onnx):
+        for encoder in (flashrank, onnx):
             with pytest.raises(asyncio.CancelledError):
                 encoder._predict_sync([("q", "doc")], cancelled)
-    local._model.predict.assert_not_called()
     flashrank._ranker.rerank.assert_not_called()
     onnx._session.run.assert_not_called()
 

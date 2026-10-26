@@ -168,9 +168,6 @@ export HINDSIGHT_API_RERANKER_LOCAL_FP16=true
 # Sort pairs by length before batching — 36–54% faster, quality-identical by construction
 export HINDSIGHT_API_RERANKER_LOCAL_BUCKET_BATCHING=true
 
-# Cap reranker parallelism so it doesn't thrash a small CPU under load (default 4)
-export HINDSIGHT_API_RERANKER_LOCAL_MAX_CONCURRENT=2
-
 # On macOS, force CPU if MPS/XPC causes instability
 # export HINDSIGHT_API_RERANKER_LOCAL_FORCE_CPU=true
 ```

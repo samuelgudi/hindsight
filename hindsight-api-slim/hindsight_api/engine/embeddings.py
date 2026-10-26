@@ -18,7 +18,7 @@ import struct
 import threading
 import warnings
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Hashable
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypeVar, cast
 from urllib.parse import parse_qs, urlparse, urlunparse
@@ -75,6 +75,7 @@ from .local_device import (
     resolve_model_device_type,
     select_local_device,
 )
+from .local_inference import LocalInferenceWorker
 from .remote_retry import (
     RetryBudget,
     RetryPolicy,
@@ -88,6 +89,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+# Texts per forward pass of the local SentenceTransformers worker. This is
+# SentenceTransformer.encode()'s own default batch size, so one pass is one of the batches
+# a single encode() call used to run internally; it also bounds how long a queued query
+# waits behind a large retain.
+LOCAL_EMBEDDINGS_PASS_SIZE = 32
 
 # What an aiohttp-based provider's request can fail with before a response parses:
 # a transport/protocol error, a non-2xx (raised with its body by raise_for_status), or
@@ -350,6 +357,8 @@ class LocalSTEmbeddings(Embeddings):
         self._model = None
         self._dimension: int | None = None
         self._device_type: str = "cpu"
+        self._worker: LocalInferenceWorker[str, list[float]] | None = None
+        self._worker_lock = threading.Lock()
 
     @property
     def provider_name(self) -> str:
@@ -434,9 +443,12 @@ class LocalSTEmbeddings(Embeddings):
 
         logger.info(f"Embeddings: local provider initialized (dim: {self._dimension}, device: {self._device_type})")
 
-    # The model runs in-process and is CPU/GPU-bound, not I/O: it goes to a worker thread
-    # so a forward pass does not block the event loop. asyncio.to_thread copies the
-    # caller's contextvars, so per-bank attribution survives the hop.
+    # The model runs in-process and is CPU/GPU-bound, not I/O, so it runs off the event
+    # loop. It used to go through asyncio.to_thread, i.e. any thread of the default
+    # executor; each of those threads then kept its own OpenMP team and MKL buffers and
+    # the process grew by GBs (see engine/local_inference.py). Now one worker thread owns
+    # the model and packs concurrent callers into shared passes. Nothing on this path
+    # reads contextvars, so not carrying them to the worker loses nothing.
     async def encode(self, texts: list[str]) -> list[list[float]]:
         """
         Generate embeddings for a list of texts.
@@ -447,49 +459,64 @@ class LocalSTEmbeddings(Embeddings):
         Returns:
             List of embedding vectors
         """
-        return await asyncio.to_thread(self._encode_local, texts)
+        return await self._encode_local(texts, None)
 
     async def encode_query(self, texts: list[str]) -> list[list[float]]:
-        return await asyncio.to_thread(self._encode_local, texts, "query")
+        return await self._encode_local(texts, "query")
 
     async def encode_documents(self, texts: list[str]) -> list[list[float]]:
-        return await asyncio.to_thread(self._encode_local, texts, "document")
+        return await self._encode_local(texts, "document")
 
-    def _encode_local(
-        self, texts: list[str], input_type: Literal["query", "document"] | None = None
+    async def _encode_local(
+        self, texts: list[str], input_type: Literal["query", "document"] | None
     ) -> list[list[float]]:
         if self._model is None:
             raise RuntimeError("Embeddings not initialized. Call initialize() first.")
+        if self._worker is None:
+            with self._worker_lock:
+                if self._worker is None:
+                    self._worker = LocalInferenceWorker(
+                        name=f"embeddings[{self.model_name}]",
+                        run_pass=self._encode_pass,
+                        pass_size=LOCAL_EMBEDDINGS_PASS_SIZE,
+                        on_idle=self._release_after_passes,
+                    )
+        # Longest first, as SentenceTransformer.encode() orders a call internally, so a
+        # job split across several passes still pads each pass to similar lengths.
+        order = sorted(range(len(texts)), key=lambda i: -len(texts[i]))
+        return await self._worker.run(texts, key=input_type, order=order)
 
-        try:
-            # Delegate to SentenceTransformers' own asymmetric entry points rather than
-            # prefixing here: they apply whatever prompts the model ships with (and route
-            # the task for models exposing a Router module), so asymmetric models such as
-            # Qwen3-Embedding get their configured query prompt without Hindsight carrying
-            # per-model prefix config the way the ONNX provider has to. Models that declare
-            # no prompts are unaffected — SentenceTransformers defaults them to empty
-            # strings and skips prompt handling entirely, so this is byte-identical to
-            # encode() for e.g. the default BAAI/bge-small-en-v1.5.
-            # encode_query/encode_document exist only in sentence-transformers >= 5.0,
-            # which is why local-ml pins that floor.
-            if input_type == "query":
-                encode = self._model.encode_query
-            elif input_type == "document":
-                encode = self._model.encode_document
-            else:
-                encode = self._model.encode
-            embeddings = encode(texts, convert_to_numpy=True, show_progress_bar=False)
-            return [emb.tolist() for emb in embeddings]
-        finally:
-            # Only reclaim the GPU allocator pool here, and only when actually on a
-            # GPU (opt-in MPS/CUDA/XPU). encode() runs in tight retain loops, so a
-            # gc.collect()/malloc_trim on every call is too costly on the CPU default
-            # — and unnecessary: refcounting frees the small transient buffers
-            # immediately and the allocator reuses them for the next batch. (The
-            # reranker keeps its per-batch heap trim for the #1717 CPU case; it runs
-            # on the lighter recall path.) See engine/local_device.py.
-            if self._device_type != "cpu":
-                release_local_inference_memory(self._device_type)
+    def _encode_pass(self, input_type: Hashable, texts: list[str]) -> list[list[float]]:
+        assert self._model is not None
+        # Delegate to SentenceTransformers' own asymmetric entry points rather than
+        # prefixing here: they apply whatever prompts the model ships with (and route
+        # the task for models exposing a Router module), so asymmetric models such as
+        # Qwen3-Embedding get their configured query prompt without Hindsight carrying
+        # per-model prefix config the way the ONNX provider has to. Models that declare
+        # no prompts are unaffected — SentenceTransformers defaults them to empty
+        # strings and skips prompt handling entirely, so this is byte-identical to
+        # encode() for e.g. the default BAAI/bge-small-en-v1.5.
+        # encode_query/encode_document exist only in sentence-transformers >= 5.0,
+        # which is why local-ml pins that floor.
+        if input_type == "query":
+            encode = self._model.encode_query
+        elif input_type == "document":
+            encode = self._model.encode_document
+        else:
+            encode = self._model.encode
+        embeddings = encode(texts, convert_to_numpy=True, show_progress_bar=False)
+        return [emb.tolist() for emb in embeddings]
+
+    def _release_after_passes(self) -> None:
+        # Only reclaim the GPU allocator pool, and only when actually on a GPU (opt-in
+        # CUDA/XPU). encode() runs in tight retain loops, so a gc.collect()/malloc_trim
+        # every time the worker drains is too costly on the CPU default — and
+        # unnecessary: refcounting frees the small transient buffers immediately and the
+        # allocator reuses them for the next pass. (The reranker keeps its heap trim for
+        # the #1717 CPU case; it runs on the lighter recall path.) See
+        # engine/local_device.py.
+        if self._device_type != "cpu":
+            release_local_inference_memory(self._device_type)
 
 
 class OnnxEmbeddings(Embeddings):

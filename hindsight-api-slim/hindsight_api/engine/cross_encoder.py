@@ -14,7 +14,7 @@ import threading
 import time
 import warnings
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Hashable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, TypeVar, cast
 
@@ -73,6 +73,7 @@ from .local_device import (
     resolve_model_device_type,
     select_local_device,
 )
+from .local_inference import LocalInferenceWorker
 from .remote_retry import RetryPolicy, acall_with_retry
 from .tei_retry import TEI_KEEPALIVE_EXPIRY_SECONDS, is_retryable_tei_transport_error, tei_retry_delay
 from .token_encoding import count_tokens, truncate_to_tokens
@@ -264,17 +265,13 @@ class LocalSTCrossEncoder(CrossEncoderModel):
     - Small model (80MB)
     - Trained for passage re-ranking
 
-    Uses a dedicated thread pool to limit concurrent CPU-bound work.
+    One worker thread owns the model and packs concurrent recalls into shared passes
+    (see engine/local_inference.py).
     """
-
-    # Shared executor across all instances (one model loaded anyway)
-    _executor: ThreadPoolExecutor | None = None
-    _max_concurrent: int = 4  # Limit concurrent CPU-bound reranking calls
 
     def __init__(
         self,
         model_name: str | None = None,
-        max_concurrent: int = 4,
         force_cpu: bool = False,
         trust_remote_code: bool = False,
         fp16: bool = False,
@@ -288,8 +285,6 @@ class LocalSTCrossEncoder(CrossEncoderModel):
         Args:
             model_name: Name of the CrossEncoder model to use.
                        Default: cross-encoder/ms-marco-MiniLM-L-6-v2
-            max_concurrent: Maximum concurrent reranking calls (default: 2).
-                           Higher values may cause CPU thrashing under load.
             force_cpu: Force CPU mode for local inference.
                       Default: False
             trust_remote_code: Allow loading models with custom code (security risk).
@@ -300,8 +295,9 @@ class LocalSTCrossEncoder(CrossEncoderModel):
             bucket_batching: Sort pairs by token length before batching to reduce
                             padding waste. 36-54% speedup, quality-identical.
                             Default: False (opt-in via env var).
-            batch_size: Batch size for predict() calls. Optimal values vary by
-                       hardware and model (CPU: 32, CUDA: 128+). Default: 32.
+            batch_size: Pairs per forward pass, which pairs from concurrent
+                       recalls share. Optimal values vary by hardware and model
+                       (CPU: 32, CUDA: 128+). Default: 32.
             timeout: Wall-clock ceiling for scoring one call's pairs. On expiry
                     predict() raises RerankTimeoutError with the partial scores
                     instead of running to completion. 0 disables. Default: 300.
@@ -315,7 +311,8 @@ class LocalSTCrossEncoder(CrossEncoderModel):
         self.timeout = timeout
         self._model = None
         self._device_type: str = "cpu"
-        LocalSTCrossEncoder._max_concurrent = max_concurrent
+        self._worker: LocalInferenceWorker[tuple[str, str], float] | None = None
+        self._worker_lock = threading.Lock()
 
     @property
     def provider_name(self) -> str:
@@ -418,68 +415,30 @@ class LocalSTCrossEncoder(CrossEncoderModel):
                 label=f"Reranker[{self.model_name}]",
             )
 
-        # Initialize shared executor (limited workers naturally limits concurrency)
-        if LocalSTCrossEncoder._executor is None:
-            LocalSTCrossEncoder._executor = ThreadPoolExecutor(
-                max_workers=LocalSTCrossEncoder._max_concurrent,
-                thread_name_prefix="reranker",
-            )
-            logger.info(
-                f"Reranker: local provider initialized "
-                f"(device: {self._device_type}, max_concurrent={LocalSTCrossEncoder._max_concurrent})"
-            )
-        else:
-            logger.info(f"Reranker: local provider initialized (device: {self._device_type}, using existing executor)")
+        logger.info(f"Reranker: local provider initialized (device: {self._device_type})")
 
-    def _predict_sync(self, pairs: list[tuple[str, str]], cancelled: threading.Event | None = None) -> list[float]:
-        """Synchronous prediction wrapper for thread pool execution.
+    def _score_pass(self, _key: Hashable, pairs: list[tuple[str, str]]) -> list[float]:
+        assert self._model is not None
+        scores = self._model.predict(pairs, batch_size=self.batch_size, show_progress_bar=False)
+        return [float(score) for score in (scores.tolist() if hasattr(scores, "tolist") else scores)]
 
-        Scores in explicit batches rather than one `predict()` call so the wall-clock
-        budget can be enforced between them — a blocking call already inside torch
-        cannot be cancelled from the event loop, and abandoning it with `wait_for`
-        would leave it burning the executor's only worker (#4696). ``cancelled`` is
-        checked at the same point (see ``_run_batches_in_executor``).
-
-        Supports two optimizations (controlled via .env):
-        - bucket_batching: sort pairs by token length to reduce padding waste (36-54% speedup)
-        - batch_size: explicit batch size for predict() calls (MPS optimal: 32)
-        """
-
-        try:
-            order = list(range(len(pairs)))
-            if self.bucket_batching and len(pairs) > 1:
-                # Sort pairs by approximate token length to create homogeneous batches.
-                # This eliminates padding waste — short pairs aren't padded to the length
-                # of the longest pair in the batch. Quality-identical by construction.
-                order.sort(key=lambda i: len(pairs[i][0]) + len(pairs[i][1]))
-
-            scores: list[float | None] = [None] * len(pairs)
-            # ponytail: the deadline is checked between batches, so one pathological
-            # batch can overshoot it. Bounded by a single batch, which is the point —
-            # cutting mid-batch would mean reaching inside the model's forward pass.
-            deadline = time.monotonic() + self.timeout if self.timeout > 0 else None
-
-            for start in range(0, len(order), self.batch_size):
-                if cancelled is not None and cancelled.is_set():
-                    raise asyncio.CancelledError()
-                if deadline is not None and time.monotonic() >= deadline:
-                    raise RerankTimeoutError(scores, self.timeout, self.model_name)
-                batch = order[start : start + self.batch_size]
-                batch_pairs = [pairs[i] for i in batch]
-                batch_scores = self._model.predict(batch_pairs, batch_size=self.batch_size, show_progress_bar=False)
-                batch_scores = batch_scores.tolist() if hasattr(batch_scores, "tolist") else list(batch_scores)
-                for i, score in zip(batch, batch_scores):
-                    scores[i] = float(score)
-
-            return [0.0 if score is None else score for score in scores]
-        finally:
-            release_local_inference_memory(self._device_type)
+    def _release_after_passes(self) -> None:
+        release_local_inference_memory(self._device_type)
 
     async def _predict(self, pairs: list[tuple[str, str]]) -> list[float]:
         """
         Score query-document pairs for relevance.
 
-        Uses a dedicated thread pool with limited workers to prevent CPU thrashing.
+        Runs on the model's single worker thread. It used to be a pool of
+        ``RERANKER_LOCAL_MAX_CONCURRENT`` threads, each of which kept its own OpenMP
+        team and MKL buffers (see engine/local_inference.py); concurrent recalls now
+        share passes of ``batch_size`` pairs instead of running side by side.
+
+        The worker checks the wall-clock budget and cancellation between passes —
+        a blocking call already inside torch cannot be interrupted, and abandoning it
+        with `wait_for` would leave it burning the worker (#4696, #5722). A pass is
+        bounded by ``batch_size``, so one pathological pass can overshoot the budget
+        by at most one pass.
 
         Args:
             pairs: List of (query, document) tuples to score
@@ -489,9 +448,27 @@ class LocalSTCrossEncoder(CrossEncoderModel):
         """
         if self._model is None:
             raise RuntimeError("Reranker not initialized. Call initialize() first.")
-
-        # Use dedicated executor - limited workers naturally limits concurrency
-        return await _run_batches_in_executor(LocalSTCrossEncoder._executor, self._predict_sync, pairs)
+        if self._worker is None:
+            with self._worker_lock:
+                if self._worker is None:
+                    self._worker = LocalInferenceWorker(
+                        name=f"reranker[{self.model_name}]",
+                        run_pass=self._score_pass,
+                        pass_size=self.batch_size,
+                        on_idle=self._release_after_passes,
+                    )
+        order = list(range(len(pairs)))
+        if self.bucket_batching and len(pairs) > 1:
+            # Sort pairs by approximate token length to create homogeneous batches.
+            # This eliminates padding waste — short pairs aren't padded to the length
+            # of the longest pair in the batch. Quality-identical by construction.
+            order.sort(key=lambda i: len(pairs[i][0]) + len(pairs[i][1]))
+        return await self._worker.run(
+            pairs,
+            order=order,
+            timeout=self.timeout,
+            timeout_error=lambda scores: RerankTimeoutError(scores, self.timeout, self.model_name),
+        )
 
 
 class RemoteTEICrossEncoder(CrossEncoderModel):
@@ -2801,7 +2778,6 @@ def _create_cross_encoder_backend(member: RerankerMemberConfig) -> CrossEncoderM
     elif provider == "local":
         return LocalSTCrossEncoder(
             model_name=member.local_model,
-            max_concurrent=member.local_max_concurrent,
             force_cpu=member.local_force_cpu,
             trust_remote_code=member.local_trust_remote_code,
             fp16=member.local_fp16,
