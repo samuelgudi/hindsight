@@ -148,6 +148,28 @@ class LocalInferenceWorker(Generic[ItemT, ResultT]):
             job.cancelled.set()
             raise
 
+    def run_blocking(self, items: list[ItemT], *, key: Hashable = None) -> list[ResultT]:
+        """Run ``items`` on the worker and block the calling thread until they are done.
+
+        For synchronous startup code (a model's smoke test, which runs inside a blocking
+        ``initialize()`` under ``LOCAL_MODEL_BUILD_LOCK``). Running the smoke test here
+        rather than on the startup thread matters for memory: the first forward pass on a
+        thread gives it an OpenMP team and MKL buffers it keeps for life, and the startup
+        thread is an executor thread that never runs the model again.
+        """
+        if not items:
+            return []
+        job: _Job = _Job(
+            key=key,
+            items=items,
+            order=list(range(len(items))),
+            future=Future(),
+            timeout=0.0,
+            timeout_error=None,
+        )
+        self._submit(job)
+        return job.future.result()
+
     def _submit(self, job: _Job) -> None:
         self._inbox.put(job)
         # The thread is started on first use rather than in __init__: tests and the

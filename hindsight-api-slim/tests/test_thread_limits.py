@@ -16,9 +16,9 @@ from hindsight_api._thread_limits import (
     _quota_to_cpus,
     apply_default_thread_limits,
     bound_onnx_session,
+    default_native_thread_count,
     native_thread_summary,
     onnx_intra_op_threads,
-    default_native_thread_count,
 )
 
 
@@ -58,7 +58,11 @@ def test_applies_defaults_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
 
     expected = str(default_native_thread_count())
     for var in _NATIVE_THREAD_VARS:
-        assert os.environ[var] == expected
+        if var == "OPENBLAS_NUM_THREADS":
+            # OpenBLAS commits 32 MiB per thread at import; see _OPENBLAS_DEFAULT_THREADS.
+            assert os.environ[var] == "1"
+        else:
+            assert os.environ[var] == expected
 
 
 def test_respects_operator_overrides(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -158,11 +158,21 @@ def default_native_thread_count() -> int:
     return min(_MAX_NATIVE_THREADS, _available_cpu_count())
 
 
+# OpenBLAS gets its own, much smaller default. It reserves a 32 MiB buffer per thread
+# as soon as numpy (and again scipy, which ships its own copy) is imported, whether or
+# not anything ever calls BLAS: at 16 threads that is 32 x 32 MiB = 1 GiB of committed
+# memory per process, measured on Windows (numpy +523 MB, scipy +501 MB; at 1 thread
+# +41 MB and +19 MB). torch does not use OpenBLAS, so the only BLAS work it serves here
+# is the within-batch semantic-link matmul in memories/pg/links.py, which is small for
+# ordinary retains and only gets slower, not wrong, for very large ones.
+_OPENBLAS_DEFAULT_THREADS = 1
+
+
 def apply_default_thread_limits() -> None:
     """Cap native ML thread pools unless the operator has set the var already."""
     value = str(default_native_thread_count())
     for var in _NATIVE_THREAD_VARS:
-        os.environ.setdefault(var, value)
+        os.environ.setdefault(var, str(_OPENBLAS_DEFAULT_THREADS) if var == "OPENBLAS_NUM_THREADS" else value)
 
 
 def onnx_intra_op_threads() -> int:

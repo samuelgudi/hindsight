@@ -68,8 +68,10 @@ from .local_device import (
     LOCAL_MODEL_BUILD_LOCK,
     align_local_model_weights,
     assert_finite_local_output,
+    map_local_model_weights_read_only,
     prefetch_local_model,
     release_local_inference_memory,
+    resolve_local_safetensors,
     resolve_model_device_type,
     select_local_device,
 )
@@ -400,6 +402,12 @@ class LocalSTCrossEncoder(CrossEncoderModel):
             align_local_model_weights(self._model.model, label=f"Reranker[{self.model_name}]")
 
             self._device_type = resolve_model_device_type(self._model)
+            if self._device_type == "cpu":
+                weights_path = resolve_local_safetensors(self.model_name, os.getenv("SENTENCE_TRANSFORMERS_HOME"))
+                if weights_path is not None:
+                    map_local_model_weights_read_only(
+                        self._model.model, weights_path, label=f"Reranker[{self.model_name}]"
+                    )
 
             # FP16 inference: convert model weights to half precision.
             # Empirically validated: 27-36% faster on MPS, quality-identical (20/20 overlap).
@@ -409,9 +417,10 @@ class LocalSTCrossEncoder(CrossEncoderModel):
 
             # Smoke-test the fully configured model (after any FP16 conversion). NaN logits
             # are sanitized to 0.0 downstream, so startup is the last point at which a model
-            # that computes garbage is still observable.
+            # that computes garbage is still observable. It runs on the model's worker
+            # thread, not this startup thread (see LocalInferenceWorker.run_blocking).
             assert_finite_local_output(
-                self._model.predict([("hindsight startup probe", "hindsight startup probe")]),
+                self._get_worker().run_blocking([("hindsight startup probe", "hindsight startup probe")]),
                 label=f"Reranker[{self.model_name}]",
             )
 
@@ -424,6 +433,18 @@ class LocalSTCrossEncoder(CrossEncoderModel):
 
     def _release_after_passes(self) -> None:
         release_local_inference_memory(self._device_type)
+
+    def _get_worker(self) -> LocalInferenceWorker[tuple[str, str], float]:
+        if self._worker is None:
+            with self._worker_lock:
+                if self._worker is None:
+                    self._worker = LocalInferenceWorker(
+                        name=f"reranker[{self.model_name}]",
+                        run_pass=self._score_pass,
+                        pass_size=self.batch_size,
+                        on_idle=self._release_after_passes,
+                    )
+        return self._worker
 
     async def _predict(self, pairs: list[tuple[str, str]]) -> list[float]:
         """
@@ -448,22 +469,13 @@ class LocalSTCrossEncoder(CrossEncoderModel):
         """
         if self._model is None:
             raise RuntimeError("Reranker not initialized. Call initialize() first.")
-        if self._worker is None:
-            with self._worker_lock:
-                if self._worker is None:
-                    self._worker = LocalInferenceWorker(
-                        name=f"reranker[{self.model_name}]",
-                        run_pass=self._score_pass,
-                        pass_size=self.batch_size,
-                        on_idle=self._release_after_passes,
-                    )
         order = list(range(len(pairs)))
         if self.bucket_batching and len(pairs) > 1:
             # Sort pairs by approximate token length to create homogeneous batches.
             # This eliminates padding waste — short pairs aren't padded to the length
             # of the longest pair in the batch. Quality-identical by construction.
             order.sort(key=lambda i: len(pairs[i][0]) + len(pairs[i][1]))
-        return await self._worker.run(
+        return await self._get_worker().run(
             pairs,
             order=order,
             timeout=self.timeout,

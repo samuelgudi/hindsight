@@ -74,10 +74,15 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import gc
+import json
 import logging
+import mmap
 import os
+import struct
 import sys
 import threading
+import warnings
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -335,6 +340,160 @@ def align_local_model_weights(model: object, *, label: str) -> int:
             len(tensors),
         )
     return copied
+
+
+#: Read-only mappings that back model weights. Kept for the life of the process: the
+#: tensors point into them, and closing one under a live tensor would crash it.
+_READ_ONLY_WEIGHT_MAPPINGS: list[mmap.mmap] = []
+_READ_ONLY_WEIGHT_LOCK = threading.Lock()
+
+_SAFETENSORS_DTYPES = {"F32": "float32", "F16": "float16", "BF16": "bfloat16", "F64": "float64", "I64": "int64"}
+
+
+@dataclass
+class _SafetensorsEntry:
+    dtype: str
+    shape: list[int]
+    begin: int
+    end: int
+
+
+@dataclass
+class _SafetensorsFile:
+    path: str
+    data_start: int
+    entries: dict[str, _SafetensorsEntry]
+
+
+def _read_safetensors_header(path: str) -> _SafetensorsFile:
+    with open(path, "rb") as f:
+        (header_len,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(header_len))
+    entries = {
+        key: _SafetensorsEntry(
+            dtype=value["dtype"],
+            shape=list(value["shape"]),
+            begin=value["data_offsets"][0],
+            end=value["data_offsets"][1],
+        )
+        for key, value in header.items()
+        if key != "__metadata__"
+    }
+    return _SafetensorsFile(path=path, data_start=8 + header_len, entries=entries)
+
+
+def _aligned_safetensors_copy(source: _SafetensorsFile) -> _SafetensorsFile:
+    """A copy of ``source`` whose data section starts on an 8-byte boundary.
+
+    The data section starts right after the JSON header, so its alignment is a property
+    of the header's length (see "Weight alignment" above). The safetensors format allows
+    the header to be padded with trailing spaces, so the copy pads it and keeps the data
+    bytes as they are. Written once, next to the Hugging Face cache, and reused.
+    """
+    from huggingface_hub import constants
+
+    with open(source.path, "rb") as f:
+        (header_len,) = struct.unpack("<Q", f.read(8))
+        header = f.read(header_len).rstrip(b" ")
+    padded_len = len(header) + (-(8 + len(header)) % 8)
+    target_dir = os.path.join(os.path.dirname(constants.HF_HUB_CACHE), "hindsight-aligned-weights")
+    # The snapshot folder name is the commit hash, so a model update gets a new copy.
+    snapshot = os.path.basename(os.path.dirname(os.path.abspath(source.path)))
+    target = os.path.join(target_dir, f"{snapshot}-{os.path.basename(source.path)}")
+    if not os.path.exists(target) or os.path.getsize(target) != os.path.getsize(source.path) - header_len + padded_len:
+        os.makedirs(target_dir, exist_ok=True)
+        partial = target + ".partial"
+        with open(source.path, "rb") as src, open(partial, "wb") as dst:
+            dst.write(struct.pack("<Q", padded_len))
+            dst.write(header.ljust(padded_len, b" "))
+            src.seek(8 + header_len)
+            while chunk := src.read(16 * 1024 * 1024):
+                dst.write(chunk)
+        os.replace(partial, target)
+    return _read_safetensors_header(target)
+
+
+def resolve_local_safetensors(model_name: str, cache_dir: str | None = None) -> str | None:
+    """Path of a local model's main ``model.safetensors``, or None when there is none."""
+    if os.path.isdir(model_name):
+        path = os.path.join(model_name, "model.safetensors")
+        return path if os.path.isfile(path) else None
+    try:
+        from huggingface_hub import try_to_load_from_cache
+
+        path = try_to_load_from_cache(model_name, "model.safetensors", cache_dir=cache_dir)
+    except Exception:  # pragma: no cover - defensive
+        return None
+    return path if isinstance(path, str) and os.path.isfile(path) else None
+
+
+def map_local_model_weights_read_only(model: object, safetensors_path: str, *, label: str) -> int:
+    """Point ``model``'s CPU weights at a read-only mapping of their safetensors file.
+
+    transformers maps safetensors copy-on-write, and Windows charges a copy-on-write
+    view to the commit limit in full even though the pages are never written: the 1.2 GB
+    embeddinggemma file costs 1.2 GB of commit (RAM + pagefile) for weights that only
+    ever get read. A misaligned file is worse, because align_local_model_weights clones
+    every tensor into private memory. A read-only view of the same file costs no commit,
+    and its pages are file-backed, so Windows can drop them under memory pressure and
+    read them back instead of writing them to the pagefile.
+
+    Each parameter and buffer whose name, dtype and shape match a tensor in the file is
+    re-pointed at the mapping; anything else (the model's small extra modules, tensors
+    the loader converted) is left alone. A misaligned file is first copied once with a
+    padded header (``_aligned_safetensors_copy``). CPU only: a GPU model already copied
+    its weights to the device. Returns the number of bytes now backed by the mapping.
+
+    The weights become read-only: a write would fault. Inference never writes weights;
+    anything that wants to (fine-tuning, an in-place dtype change) must not run on a
+    model mapped this way.
+    """
+    import torch
+
+    named_parameters = getattr(model, "named_parameters", None)
+    named_buffers = getattr(model, "named_buffers", None)
+    if named_parameters is None or named_buffers is None:
+        raise TypeError(f"{label}: expected a torch module, got {type(model).__name__}")
+
+    weights = _read_safetensors_header(safetensors_path)
+    if weights.data_start % 8:
+        weights = _aligned_safetensors_copy(weights)
+    with open(weights.path, "rb") as f:
+        mapping = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+
+    tensors = list(named_parameters(remove_duplicate=False)) + list(named_buffers(remove_duplicate=False))
+    mapped = 0
+    with warnings.catch_warnings():
+        # torch warns that the buffer is not writable; that is the point.
+        warnings.filterwarnings("ignore", message=".*not writable.*")
+        for name, tensor in tensors:
+            if tensor.device.type != "cpu":
+                continue
+            entry = next(
+                (e for key, e in weights.entries.items() if name == key or name.endswith("." + key)),
+                None,
+            )
+            dtype_name = _SAFETENSORS_DTYPES.get(entry.dtype) if entry is not None else None
+            if entry is None or dtype_name is None or getattr(torch, dtype_name) != tensor.dtype:
+                continue
+            if list(tensor.shape) != entry.shape or entry.end - entry.begin != tensor.numel() * tensor.element_size():
+                continue
+            view = torch.frombuffer(
+                mapping, dtype=tensor.dtype, count=tensor.numel(), offset=weights.data_start + entry.begin
+            ).view(tensor.shape)
+            # Same check as align_local_model_weights: a sub-element offset corrupts matmul.
+            if _misaligned(view):
+                continue
+            tensor.data = view
+            mapped += view.numel() * view.element_size()
+
+    if mapped:
+        with _READ_ONLY_WEIGHT_LOCK:
+            _READ_ONLY_WEIGHT_MAPPINGS.append(mapping)
+        logger.info("%s: %.0f MB of weights mapped read-only from %s", label, mapped / 2**20, weights.path)
+    else:
+        mapping.close()
+    return mapped
 
 
 def assert_finite_local_output(values: object, *, label: str) -> None:

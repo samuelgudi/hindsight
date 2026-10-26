@@ -42,7 +42,7 @@ class _Probe:
 def _fake_embedder() -> torch.nn.Module:
     model = torch.nn.Linear(4, 4)
     model.get_sentence_embedding_dimension = lambda: 4  # type: ignore[attr-defined]
-    model.encode = lambda texts: np.zeros((len(texts), 4), dtype=np.float32)  # type: ignore[attr-defined]
+    model.encode = lambda texts, **_: np.zeros((len(texts), 4), dtype=np.float32)  # type: ignore[attr-defined]
     return model
 
 

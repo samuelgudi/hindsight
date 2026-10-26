@@ -70,8 +70,10 @@ from .local_device import (
     LOCAL_MODEL_BUILD_LOCK,
     align_local_model_weights,
     assert_finite_local_output,
+    map_local_model_weights_read_only,
     prefetch_local_model,
     release_local_inference_memory,
+    resolve_local_safetensors,
     resolve_model_device_type,
     select_local_device,
 )
@@ -438,11 +440,16 @@ class LocalSTEmbeddings(Embeddings):
                 get_dimension = self._model.get_sentence_embedding_dimension
             self._dimension = get_dimension()
             self._device_type = resolve_model_device_type(self._model)
+            if self._device_type == "cpu":
+                weights_path = resolve_local_safetensors(self.model_name, os.getenv("SENTENCE_TRANSFORMERS_HOME"))
+                if weights_path is not None:
+                    map_local_model_weights_read_only(self._model, weights_path, label=f"Embeddings[{self.model_name}]")
 
             # Smoke-test before serving: a NaN embedding is invisible downstream (it
-            # normalizes away and pgvector stores it), so fail startup instead.
+            # normalizes away and pgvector stores it), so fail startup instead. It runs
+            # on the model's worker thread, not this startup thread (see run_blocking).
             assert_finite_local_output(
-                self._model.encode(["hindsight startup probe"]),
+                self._get_worker().run_blocking(["hindsight startup probe"]),
                 label=f"Embeddings[{self.model_name}]",
             )
 
@@ -477,6 +484,12 @@ class LocalSTEmbeddings(Embeddings):
     ) -> list[list[float]]:
         if self._model is None:
             raise RuntimeError("Embeddings not initialized. Call initialize() first.")
+        # Longest first, as SentenceTransformer.encode() orders a call internally, so a
+        # job split across several passes still pads each pass to similar lengths.
+        order = sorted(range(len(texts)), key=lambda i: -len(texts[i]))
+        return await self._get_worker().run(texts, key=input_type, order=order)
+
+    def _get_worker(self) -> LocalInferenceWorker[str, list[float]]:
         if self._worker is None:
             with self._worker_lock:
                 if self._worker is None:
@@ -488,10 +501,7 @@ class LocalSTEmbeddings(Embeddings):
                         item_cost=len,
                         pass_budget=LOCAL_EMBEDDINGS_PASS_CHARS,
                     )
-        # Longest first, as SentenceTransformer.encode() orders a call internally, so a
-        # job split across several passes still pads each pass to similar lengths.
-        order = sorted(range(len(texts)), key=lambda i: -len(texts[i]))
-        return await self._worker.run(texts, key=input_type, order=order)
+        return self._worker
 
     def _encode_pass(self, input_type: Hashable, texts: list[str]) -> list[list[float]]:
         assert self._model is not None

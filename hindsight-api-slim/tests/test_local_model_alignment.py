@@ -194,7 +194,7 @@ class TestLoadersGuardTheirWeights:
 
         fake = _Tiny(misaligned=True)
         fake.get_sentence_embedding_dimension = lambda: 64  # type: ignore[method-assign]
-        fake.encode = lambda texts: np.zeros((len(texts), 64), dtype=np.float32)  # type: ignore[method-assign]
+        fake.encode = lambda texts, **_: np.zeros((len(texts), 64), dtype=np.float32)  # type: ignore[method-assign]
         embeddings = LocalSTEmbeddings(model_name="test-model", force_cpu=True)
 
         with patch("sentence_transformers.SentenceTransformer", return_value=fake):
@@ -223,7 +223,7 @@ class TestLoadersGuardTheirWeights:
 
         fake = _Tiny(misaligned=False)
         fake.get_sentence_embedding_dimension = lambda: 64  # type: ignore[method-assign]
-        fake.encode = lambda texts: np.full((len(texts), 64), np.nan, dtype=np.float32)  # type: ignore[method-assign]
+        fake.encode = lambda texts, **_: np.full((len(texts), 64), np.nan, dtype=np.float32)  # type: ignore[method-assign]
         embeddings = LocalSTEmbeddings(model_name="test-model", force_cpu=True)
 
         with patch("sentence_transformers.SentenceTransformer", return_value=fake):
