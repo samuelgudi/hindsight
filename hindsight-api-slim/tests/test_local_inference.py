@@ -77,6 +77,23 @@ async def test_a_job_larger_than_a_pass_is_split_and_reassembled_in_order():
     assert [batch for _, batch in model.passes] == [["dddd", "ccc"], ["bb", "a"], ["e"]]
 
 
+async def test_a_long_item_does_not_pad_a_pass_of_short_ones():
+    model = _GatedModel()
+    worker = LocalInferenceWorker("test", model, pass_size=8, item_cost=len, pass_budget=12)
+    first = await _queue_behind_first_pass(worker, model)
+
+    short = asyncio.create_task(worker.run(["aa", "bb", "cc"]))
+    page = asyncio.create_task(worker.run(["p" * 20]))
+    tail = asyncio.create_task(worker.run(["dd", "ee"]))
+    await asyncio.sleep(0.05)
+    model.release.set()
+    await asyncio.wait_for(asyncio.gather(first, short, page, tail), 5)
+
+    # 3 x 2 fits the budget of 12; the 20-long page would make 4 x 20, so it waits and
+    # then runs alone (a first item is always taken); the rest stays in FIFO order.
+    assert [items for _, items in model.passes] == [["x"], ["aa", "bb", "cc"], ["p" * 20], ["dd", "ee"]]
+
+
 async def test_different_keys_never_share_a_pass():
     model = _GatedModel()
     worker = LocalInferenceWorker("test", model, pass_size=8)

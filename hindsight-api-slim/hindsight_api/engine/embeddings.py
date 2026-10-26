@@ -95,6 +95,11 @@ T = TypeVar("T")
 # a single encode() call used to run internally; it also bounds how long a queued query
 # waits behind a large retain.
 LOCAL_EMBEDDINGS_PASS_SIZE = 32
+# Padded size of one pass, in characters (texts x longest text). Packing callers together
+# must not pad short retain texts up to a long knowledge page: 48k characters is 32 texts
+# of ~1,500 characters (~400 tokens), and a longer text takes proportionally fewer
+# companions or runs alone. See LocalInferenceWorker.
+LOCAL_EMBEDDINGS_PASS_CHARS = 48_000
 
 # What an aiohttp-based provider's request can fail with before a response parses:
 # a transport/protocol error, a non-2xx (raised with its body by raise_for_status), or
@@ -480,6 +485,8 @@ class LocalSTEmbeddings(Embeddings):
                         run_pass=self._encode_pass,
                         pass_size=LOCAL_EMBEDDINGS_PASS_SIZE,
                         on_idle=self._release_after_passes,
+                        item_cost=len,
+                        pass_budget=LOCAL_EMBEDDINGS_PASS_CHARS,
                     )
         # Longest first, as SentenceTransformer.encode() orders a call internally, so a
         # job split across several passes still pads each pass to similar lengths.

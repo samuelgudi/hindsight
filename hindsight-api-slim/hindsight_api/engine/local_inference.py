@@ -84,6 +84,15 @@ class LocalInferenceWorker(Generic[ItemT, ResultT]):
     embeddings use it to keep query and document prompts apart). ``on_idle`` runs on the
     worker thread whenever it has no work left, before the last results are handed back,
     which is where per-batch memory release belongs.
+
+    ``item_cost`` and ``pass_budget`` bound a pass by its padded size as well as by its
+    item count: a pass is padded to its longest item, so its activations grow with
+    ``items x longest``. Packing jobs together made that worse than one call per job —
+    a 2,048-token knowledge page landing in a pass with 31 retain chunks pads all 32 of
+    them to 2,048 tokens (about 1.5 GB of activations for embeddinggemma, against ~40 MB
+    for the page on its own). A pass therefore stops growing once ``count x max(cost)``
+    would exceed the budget; its first item is always taken, so an oversized item still
+    runs, alone.
     """
 
     def __init__(
@@ -92,11 +101,15 @@ class LocalInferenceWorker(Generic[ItemT, ResultT]):
         run_pass: Callable[[Hashable, list[ItemT]], Sequence[ResultT]],
         pass_size: int,
         on_idle: Callable[[], None] | None = None,
+        item_cost: Callable[[ItemT], int] | None = None,
+        pass_budget: int | None = None,
     ):
         self.name = name
         self._run_pass = run_pass
         self.pass_size = max(1, pass_size)
         self._on_idle = on_idle
+        self._item_cost = item_cost
+        self._pass_budget = pass_budget
         self._inbox: queue.SimpleQueue[_Job] = queue.SimpleQueue()
         self._start_lock = threading.Lock()
         self._thread: threading.Thread | None = None
@@ -207,16 +220,30 @@ class LocalInferenceWorker(Generic[ItemT, ResultT]):
     def _pack(self, active: list[_Job]) -> list[_Slice]:
         """Fill one pass from the oldest job onward, skipping jobs keyed differently."""
         key = active[0].key
-        room = self.pass_size
+        count = 0
+        longest = 0
         slices: list[_Slice] = []
         for job in active:
-            if room == 0:
+            if count == self.pass_size:
                 break
             if job.key != key:
                 continue
-            take = job.order[job.cursor : job.cursor + room]
-            slices.append(_Slice(job=job, positions=take))
-            room -= len(take)
+            take: list[int] = []
+            for position in job.order[job.cursor :]:
+                if count == self.pass_size:
+                    break
+                if self._item_cost is not None and self._pass_budget is not None:
+                    cost = max(longest, self._item_cost(job.items[position]))
+                    if count > 0 and (count + 1) * cost > self._pass_budget:
+                        # Stop at the first item that does not fit rather than skipping
+                        # ahead to a shorter one: the job's order and FIFO across jobs
+                        # stay intact, and the next pass starts from this item.
+                        return slices + [_Slice(job=job, positions=take)] if take else slices
+                    longest = cost
+                take.append(position)
+                count += 1
+            if take:
+                slices.append(_Slice(job=job, positions=take))
         return slices
 
     def _idle_if_drained(self, active: list[_Job]) -> None:
